@@ -19,14 +19,17 @@ package org.apache.beam.runners.flink.translation.wrappers.streaming.state;
 
 import java.nio.ByteBuffer;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Stream;
 import javax.annotation.Nonnull;
 import org.apache.beam.runners.core.StateInternals;
 import org.apache.beam.runners.core.StateNamespace;
+import org.apache.beam.runners.core.StateNamespaces;
 import org.apache.beam.runners.core.StateTag;
 import org.apache.beam.runners.flink.translation.types.CoderTypeSerializer;
 import org.apache.beam.runners.flink.translation.wrappers.streaming.FlinkKeyUtils;
@@ -47,6 +50,7 @@ import org.apache.beam.sdk.state.ValueState;
 import org.apache.beam.sdk.state.WatermarkHoldState;
 import org.apache.beam.sdk.transforms.Combine;
 import org.apache.beam.sdk.transforms.CombineWithContext;
+import org.apache.beam.sdk.transforms.windowing.GlobalWindow;
 import org.apache.beam.sdk.transforms.windowing.TimestampCombiner;
 import org.apache.beam.sdk.util.CombineContextFactory;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions;
@@ -56,6 +60,7 @@ import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.state.StateDescriptor;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeutils.base.BooleanSerializer;
 import org.apache.flink.api.common.typeutils.base.StringSerializer;
@@ -76,6 +81,13 @@ public class FlinkStateInternals<K> implements StateInternals {
   private final KeyedStateBackend<ByteBuffer> flinkStateBackend;
   private Coder<K> keyCoder;
 
+  /**
+   * A set which contains all state descriptors created in the global window. Used for cleanup on
+   * final watermark.
+   */
+  @SuppressWarnings("rawtypes")
+  private final Set<StateDescriptor> globalWindowStateDescriptors = new HashSet<>();
+
   // Watermark holds for all keys/windows of this partition, allows efficient lookup of the minimum
   private final TreeMap<Long, Integer> watermarkHolds = new TreeMap<>();
   // State to persist combined watermark holds for all keys of this partition
@@ -90,6 +102,7 @@ public class FlinkStateInternals<K> implements StateInternals {
     this.flinkStateBackend = flinkStateBackend;
     this.keyCoder = keyCoder;
     restoreWatermarkHoldsView();
+    globalWindowStateDescriptors.add(watermarkHoldStateDescriptor);
   }
 
   /** Returns the minimum over all watermark holds. */
@@ -113,6 +126,29 @@ public class FlinkStateInternals<K> implements StateInternals {
     return address.getSpec().bind(address.getId(), new FlinkStateBinder(namespace, context));
   }
 
+  /**
+   * Allows to clear all state for the global watermark when the maximum watermark arrives. We do
+   * not clean up the global window state via timers because we are not guranteed to ever receive
+   * the final watermark which would lead to an unbounded number of keys and cleanup timers.
+   * Instead, the cleanup code below should be run when we finally receive the max watermark.
+   */
+  public void clearGlobalState() {
+    StateNamespace namespace =
+        StateNamespaces.window(GlobalWindow.Coder.INSTANCE, GlobalWindow.INSTANCE);
+    try {
+      for (StateDescriptor stateDescriptor : globalWindowStateDescriptors) {
+        flinkStateBackend.applyToAllKeys(
+            namespace.stringKey(),
+            StringSerializer.INSTANCE,
+            stateDescriptor,
+            (key, state) -> state.clear());
+      }
+      globalWindowStateDescriptors.clear();
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to cleanup global state.", e);
+    }
+  }
+
   private class FlinkStateBinder implements StateBinder {
 
     private final StateNamespace namespace;
@@ -126,17 +162,27 @@ public class FlinkStateInternals<K> implements StateInternals {
     @Override
     public <T2> ValueState<T2> bindValue(
         String id, StateSpec<ValueState<T2>> spec, Coder<T2> coder) {
-      return new FlinkValueState<>(flinkStateBackend, id, namespace, coder);
+      ValueStateDescriptor<T2> valueStateDescriptor =
+          new ValueStateDescriptor<>(id, new CoderTypeSerializer<>(coder));
+      globalWindowStateDescriptors.add(valueStateDescriptor);
+      return new FlinkValueState<>(flinkStateBackend, id, namespace, valueStateDescriptor);
     }
 
     @Override
     public <T2> BagState<T2> bindBag(String id, StateSpec<BagState<T2>> spec, Coder<T2> elemCoder) {
-      return new FlinkBagState<>(flinkStateBackend, id, namespace, elemCoder);
+      ListStateDescriptor<T2> listStateDescriptor =
+          new ListStateDescriptor<>(id, new CoderTypeSerializer<>(elemCoder));
+      globalWindowStateDescriptors.add(listStateDescriptor);
+      return new FlinkBagState<>(flinkStateBackend, id, namespace, elemCoder, listStateDescriptor);
     }
 
     @Override
     public <T2> SetState<T2> bindSet(String id, StateSpec<SetState<T2>> spec, Coder<T2> elemCoder) {
-      return new FlinkSetState<>(flinkStateBackend, id, namespace, elemCoder);
+      MapStateDescriptor<T2, Boolean> mapStateDescriptor =
+          new MapStateDescriptor<>(
+              id, new CoderTypeSerializer<>(elemCoder), new BooleanSerializer());
+      globalWindowStateDescriptors.add(mapStateDescriptor);
+      return new FlinkSetState<>(flinkStateBackend, id, namespace, mapStateDescriptor);
     }
 
     @Override
@@ -145,7 +191,10 @@ public class FlinkStateInternals<K> implements StateInternals {
         StateSpec<MapState<KeyT, ValueT>> spec,
         Coder<KeyT> mapKeyCoder,
         Coder<ValueT> mapValueCoder) {
-      return new FlinkMapState<>(flinkStateBackend, id, namespace, mapKeyCoder, mapValueCoder);
+      MapStateDescriptor<KeyT, ValueT> mapStateDescriptor =
+          new MapStateDescriptor<>(
+              id, new CoderTypeSerializer<>(mapKeyCoder), new CoderTypeSerializer<>(mapValueCoder));
+      return new FlinkMapState<>(flinkStateBackend, id, namespace, mapStateDescriptor);
     }
 
     @Override
@@ -154,7 +203,10 @@ public class FlinkStateInternals<K> implements StateInternals {
         StateSpec<CombiningState<InputT, AccumT, OutputT>> spec,
         Coder<AccumT> accumCoder,
         Combine.CombineFn<InputT, AccumT, OutputT> combineFn) {
-      return new FlinkCombiningState<>(flinkStateBackend, id, combineFn, namespace, accumCoder);
+      ValueStateDescriptor<AccumT> valueStateDescriptor =
+          new ValueStateDescriptor<>(id, new CoderTypeSerializer<>(accumCoder));
+      return new FlinkCombiningState<>(
+          flinkStateBackend, id, combineFn, namespace, valueStateDescriptor);
     }
 
     @Override
@@ -164,12 +216,14 @@ public class FlinkStateInternals<K> implements StateInternals {
             StateSpec<CombiningState<InputT, AccumT, OutputT>> spec,
             Coder<AccumT> accumCoder,
             CombineWithContext.CombineFnWithContext<InputT, AccumT, OutputT> combineFn) {
+      ValueStateDescriptor<AccumT> valueStateDescriptor =
+          new ValueStateDescriptor<>(id, new CoderTypeSerializer<>(accumCoder));
       return new FlinkCombiningStateWithContext<>(
           flinkStateBackend,
           id,
           combineFn,
           namespace,
-          accumCoder,
+          valueStateDescriptor,
           CombineContextFactory.createFromStateContext(stateContext));
     }
 
@@ -192,13 +246,13 @@ public class FlinkStateInternals<K> implements StateInternals {
         KeyedStateBackend<ByteBuffer> flinkStateBackend,
         String stateId,
         StateNamespace namespace,
-        Coder<T> coder) {
+        ValueStateDescriptor<T> flinkStateDescriptor) {
 
       this.namespace = namespace;
       this.stateId = stateId;
       this.flinkStateBackend = flinkStateBackend;
 
-      flinkStateDescriptor = new ValueStateDescriptor<>(stateId, new CoderTypeSerializer<>(coder));
+      this.flinkStateDescriptor = flinkStateDescriptor;
     }
 
     @Override
@@ -276,14 +330,14 @@ public class FlinkStateInternals<K> implements StateInternals {
         KeyedStateBackend<ByteBuffer> flinkStateBackend,
         String stateId,
         StateNamespace namespace,
-        Coder<T> coder) {
+        Coder<T> coder,
+        ListStateDescriptor<T> flinkStateDescriptor) {
 
       this.namespace = namespace;
       this.stateId = stateId;
       this.flinkStateBackend = flinkStateBackend;
       this.storesVoidValues = coder instanceof VoidCoder;
-      this.flinkStateDescriptor =
-          new ListStateDescriptor<>(stateId, new CoderTypeSerializer<>(coder));
+      this.flinkStateDescriptor = flinkStateDescriptor;
     }
 
     @Override
@@ -415,15 +469,14 @@ public class FlinkStateInternals<K> implements StateInternals {
         String stateId,
         Combine.CombineFn<InputT, AccumT, OutputT> combineFn,
         StateNamespace namespace,
-        Coder<AccumT> accumCoder) {
+        ValueStateDescriptor<AccumT> flinkStateDescriptor) {
 
       this.namespace = namespace;
       this.stateId = stateId;
       this.combineFn = combineFn;
       this.flinkStateBackend = flinkStateBackend;
 
-      flinkStateDescriptor =
-          new ValueStateDescriptor<>(stateId, new CoderTypeSerializer<>(accumCoder));
+      this.flinkStateDescriptor = flinkStateDescriptor;
     }
 
     @Override
@@ -577,7 +630,7 @@ public class FlinkStateInternals<K> implements StateInternals {
         String stateId,
         CombineWithContext.CombineFnWithContext<InputT, AccumT, OutputT> combineFn,
         StateNamespace namespace,
-        Coder<AccumT> accumCoder,
+        ValueStateDescriptor<AccumT> flinkStateDescriptor,
         CombineWithContext.Context context) {
 
       this.namespace = namespace;
@@ -586,8 +639,7 @@ public class FlinkStateInternals<K> implements StateInternals {
       this.flinkStateBackend = flinkStateBackend;
       this.context = context;
 
-      flinkStateDescriptor =
-          new ValueStateDescriptor<>(stateId, new CoderTypeSerializer<>(accumCoder));
+      this.flinkStateDescriptor = flinkStateDescriptor;
     }
 
     @Override
@@ -862,16 +914,11 @@ public class FlinkStateInternals<K> implements StateInternals {
         KeyedStateBackend<ByteBuffer> flinkStateBackend,
         String stateId,
         StateNamespace namespace,
-        Coder<KeyT> mapKeyCoder,
-        Coder<ValueT> mapValueCoder) {
+        MapStateDescriptor<KeyT, ValueT> flinkStateDescriptor) {
       this.namespace = namespace;
       this.stateId = stateId;
       this.flinkStateBackend = flinkStateBackend;
-      this.flinkStateDescriptor =
-          new MapStateDescriptor<>(
-              stateId,
-              new CoderTypeSerializer<>(mapKeyCoder),
-              new CoderTypeSerializer<>(mapValueCoder));
+      this.flinkStateDescriptor = flinkStateDescriptor;
     }
 
     @Override
@@ -1049,13 +1096,11 @@ public class FlinkStateInternals<K> implements StateInternals {
         KeyedStateBackend<ByteBuffer> flinkStateBackend,
         String stateId,
         StateNamespace namespace,
-        Coder<T> coder) {
+        MapStateDescriptor<T, Boolean> flinkStateDescriptor) {
       this.namespace = namespace;
       this.stateId = stateId;
       this.flinkStateBackend = flinkStateBackend;
-      this.flinkStateDescriptor =
-          new MapStateDescriptor<>(
-              stateId, new CoderTypeSerializer<>(coder), new BooleanSerializer());
+      this.flinkStateDescriptor = flinkStateDescriptor;
     }
 
     @Override

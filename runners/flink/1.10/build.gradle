@@ -26,7 +26,7 @@ project.ext {
   test_source_overrides = ["${basePath}/1.8/src/test/java", "${basePath}/1.9/src/test/java", './src/test/java']
   main_resources_overrides = []
   test_resources_overrides = []
-  archives_base_name = 'beam-runners-flink-1.10'
+  archives_base_name = 'beam-runners-flink-1.10-rtp'
 }
 
 // Load the main build script which contains all build logic.

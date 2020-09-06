@@ -889,7 +889,7 @@ public class ExecutableStageDoFnOperator<InputT, OutputT> extends DoFnOperator<I
   }
 
   static class CleanupTimer<InputT> implements StatefulDoFnRunner.CleanupTimer<InputT> {
-    private static final String GC_TIMER_ID = "__user-state-cleanup__";
+    public static final String GC_TIMER_ID = "__user-state-cleanup__";
 
     private final TimerInternals timerInternals;
     private final Lock stateBackendLock;
