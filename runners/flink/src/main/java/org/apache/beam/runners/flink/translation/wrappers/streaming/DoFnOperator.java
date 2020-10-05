@@ -305,8 +305,20 @@ public class DoFnOperator<InputT, OutputT> extends AbstractStreamOperator<Window
       DoFnRunner<InputT, OutputT> wrappedRunner, StepContext stepContext) {
 
     if (keyCoder != null) {
-      StatefulDoFnRunner.CleanupTimer cleanupTimer =
-          new StatefulDoFnRunner.TimeInternalsCleanupTimer(timerInternals, windowingStrategy);
+      StatefulDoFnRunner.CleanupTimer<InputT> cleanupTimer =
+          new StatefulDoFnRunner.TimeInternalsCleanupTimer<InputT>(
+              timerInternals, windowingStrategy) {
+            @Override
+            public void setForWindow(InputT input, BoundedWindow window) {
+              if (!window.equals(GlobalWindow.INSTANCE)) {
+                // Skip setting a cleanup timer for the global window as these timers
+                // lead to potentially unbounded state growth in the runner, depending on key
+                // cardinality. Cleanup for global window will be performed upon arrival of the
+                // final watermark.
+                super.setForWindow(input, window);
+              }
+            }
+          };
 
       // we don't know the window type
       @SuppressWarnings({"unchecked", "rawtypes"})
@@ -1300,19 +1312,6 @@ public class DoFnOperator<InputT, OutputT> extends AbstractStreamOperator<Window
     @Deprecated
     @Override
     public void setTimer(TimerData timer) {
-      if (timer.getTimestamp().isAfter(GlobalWindow.INSTANCE.maxTimestamp())) {
-        if (timer.getTimerId().equals(StatefulDoFnRunner.TimeInternalsCleanupTimer.GC_TIMER_ID)
-            || timer.getTimerId().equals(ExecutableStageDoFnOperator.CleanupTimer.GC_TIMER_ID)) {
-          // Skip setting a cleanup timer for the global window as these timers
-          // lead to potentially unbounded state growth in the runner, depending on key cardinality.
-          // Cleanup for global window will be performed upon arrival of the final watermark
-          // in in cleanupGlobalWindowState.
-          return;
-        } else {
-          throw new IllegalStateException(
-              "Timer cannot be set past the maximum timestamp: " + timer);
-        }
-      }
       try {
         LOG.debug(
             "Setting timer: {} at {} with output time {}",
